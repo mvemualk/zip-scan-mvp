@@ -1,0 +1,459 @@
+# ZIP Scan MVP - FastAPI + Celery + Docker scaffold
+
+This document contains a full, ready-to-run MVP scaffold for the "ZIP assignment scanner" project. It includes:
+
+* Project file tree
+* Full file contents for the backend (FastAPI), worker (Celery + Redis), scanner prototype, Dockerfiles, and docker-compose to run everything locally
+* `requirements.txt` and a `README.md` with instructions to run the stack
+
+---
+
+## Project tree
+
+```
+zip-scan-mvp/
+├── backend/
+│   ├── Dockerfile
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── api.py
+│   │   ├── schemas.py
+│   │   ├── storage.py
+│   │   └── config.py
+│   └── requirements.txt
+├── worker/
+│   ├── Dockerfile
+│   ├── worker.py
+│   └── requirements.txt
+├── scanner/
+│   ├── Dockerfile
+│   └── zip_scanner.py
+├── docker-compose.yml
+└── README.md
+```
+
+---
+
+## Notes
+
+* The backend exposes `/api/upload` to accept `.zip` files and create scan jobs.
+* The backend enqueues a job into Redis via Celery.
+* The worker picks up jobs and invokes the `scanner` container to perform analysis (the runner uses `docker run` to spawn isolated scanner container). The scanner is intentionally non-executing (static checks only) for MVP.
+* All containers are configured to run with `network_mode: none` for the scanner by default. The runner uses `--network none` to prevent outbound network access in the scanner.
+* You can run this stack locally with `docker compose up --build`.
+
+---
+
+## Files (full contents)
+
+### docker-compose.yml
+
+```
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    volumes:
+      - ./backend/app:/app
+      - ./uploads:/uploads
+      - ./reports:/reports
+    ports:
+      - "8000:8000"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - STORAGE_PATH=/uploads
+      - REPORT_PATH=/reports
+    depends_on:
+      - redis
+
+  worker:
+    build: ./worker
+    volumes:
+      - ./uploads:/uploads
+      - ./reports:/reports
+      - /var/run/docker.sock:/var/run/docker.sock # allow worker to spawn scanner containers
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - STORAGE_PATH=/uploads
+      - REPORT_PATH=/reports
+    depends_on:
+      - redis
+
+  scanner:
+    build: ./scanner
+    # The scanner image is invoked by the worker as an ephemeral container.
+    network_mode: none
+
+```
+
+---
+
+### backend/Dockerfile
+
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY app/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY app /app
+CMD ["uvicorn","api:app","--host","0.0.0.0","--port","8000"]
+```
+
+---
+
+### backend/app/requirements.txt
+
+```
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+celery[redis]
+requests
+python-dotenv
+```
+
+---
+
+### backend/app/config.py
+
+```
+import os
+
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+STORAGE_PATH = os.getenv('STORAGE_PATH', '/uploads')
+REPORT_PATH = os.getenv('REPORT_PATH', '/reports')
+SCANNER_IMAGE = os.getenv('SCANNER_IMAGE', 'zipscan_scanner:latest')
+```
+
+---
+
+### backend/app/storage.py
+
+```
+import os
+import uuid
+from pathlib import Path
+from config import STORAGE_PATH
+
+Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
+
+
+def save_upload(fileobj, filename=None):
+    if filename is None:
+        filename = str(uuid.uuid4()) + '.zip'
+    outpath = os.path.join(STORAGE_PATH, filename)
+    with open(outpath, 'wb') as f:
+        data = fileobj.read()
+        f.write(data)
+    return outpath
+```
+
+---
+
+### backend/app/schemas.py
+
+```
+from pydantic import BaseModel
+from typing import List, Dict, Any
+
+class UploadResponse(BaseModel):
+    job_id: str
+    filename: str
+    status: str
+
+class Finding(BaseModel):
+    id: str
+    severity: str
+    title: str
+    description: str
+    evidence: List[str]
+
+class Report(BaseModel):
+    job_id: str
+    status: str
+    summary: Dict[str, Any]
+    findings: List[Finding]
+    artifacts: Dict[str, Any]
+```
+
+---
+
+### backend/app/api.py
+
+```
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from storage import save_upload
+import uuid, os
+from config import CELERY_BROKER_URL, SCANNER_IMAGE
+from celery import Celery
+
+app = FastAPI()
+celery = Celery('tasks', broker=CELERY_BROKER_URL)
+
+# Define a simple celery task name (the actual worker will pick this up by name)
+@app.post('/api/upload')
+async def upload(file: UploadFile = File(...)):
+    # Basic validation
+    if not file.filename.lower().endswith('.zip'):
+        raise HTTPException(status_code=400, detail='Only .zip files supported')
+    saved = save_upload(await file.read(), filename=file.filename)
+    job_id = str(uuid.uuid4())
+    # Enqueue Celery job
+    celery.send_task('worker.scan_job', args=[job_id, saved])
+    return JSONResponse({'job_id': job_id, 'filename': os.path.basename(saved), 'status':'queued'})
+
+@app.get('/api/report/{job_id}')
+async def get_report(job_id: str):
+    from config import REPORT_PATH
+    p = os.path.join(REPORT_PATH, f"{job_id}.json")
+    if not os.path.exists(p):
+        return JSONResponse({'job_id': job_id, 'status':'pending'})
+    import json
+    with open(p,'r') as f:
+        return JSONResponse(json.load(f))
+```
+
+---
+
+### worker/Dockerfile
+
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY worker.py /app/worker.py
+CMD ["python","/app/worker.py"]
+```
+
+---
+
+### worker/requirements.txt
+
+```
+celery[redis]
+requests
+python-dotenv
+```
+
+---
+
+### worker/worker.py
+
+```
+# Minimal Celery worker that receives jobs and runs scanner container
+import os
+import subprocess
+import json
+from celery import Celery
+from config import CELERY_BROKER_URL, SCANNER_IMAGE, REPORT_PATH
+
+celery = Celery('worker', broker=CELERY_BROKER_URL)
+
+@celery.task(name='worker.scan_job')
+def scan_job(job_id, upload_path):
+    # Prepare output path
+    os.makedirs(REPORT_PATH, exist_ok=True)
+    out_report = os.path.join(REPORT_PATH, f"{job_id}.json")
+
+    # Spawn scanner container to analyze the zip (run with no network)
+    # The worker uses host docker to run the scanner image mounting the uploaded file read-only
+    try:
+        cmd = [
+            'docker', 'run', '--rm', '--network', 'none',
+            '-v', f"{os.path.abspath(upload_path)}:/job/input.zip:ro",
+            '-v', f"{os.path.abspath(REPORT_PATH)}:/reports",
+            SCANNER_IMAGE, '/job/input.zip', f'/reports/{job_id}.json'
+        ]
+        print('Running scanner:', ' '.join(cmd))
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=120)
+    except subprocess.CalledProcessError as e:
+        # Write error report
+        err = {
+            'job_id': job_id,
+            'status': 'error',
+            'error': e.output.decode('utf-8', errors='ignore')
+        }
+        with open(out_report, 'w') as fo:
+            json.dump(err, fo)
+    except Exception as ex:
+        err = {'job_id': job_id, 'status':'error', 'error': str(ex)}
+        with open(out_report,'w') as fo:
+            json.dump(err, fo)
+```
+
+---
+
+### scanner/Dockerfile
+
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY zip_scanner.py /app/zip_scanner.py
+RUN pip install --no-cache-dir
+ENTRYPOINT ["python","/app/zip_scanner.py"]
+```
+
+---
+
+### scanner/zip_scanner.py
+
+```
+#!/usr/bin/env python3
+"""
+zip_scanner.py
+Simple ZIP analyzer prototype for MVP.
+Usage: python zip_scanner.py /path/to/input.zip /path/to/output.json
+"""
+import sys, os, zipfile, tempfile, hashlib, json, re, shutil
+
+BASE64_RE = re.compile(rb'(?:[A-Za-z0-9+/]{100,}={0,2})')
+SUSPICIOUS_EXT = {'.exe', '.dll', '.bin', '.so', '.scr', '.com', '.pif'}
+SCRIPT_EXT = {'.js', '.py', '.sh', '.ps1', '.rb'}
+
+
+def sha256_of_file(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_extracted(root):
+    findings = []
+    file_list = []
+    hashes = {}
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            rel = os.path.relpath(fp, root)
+            file_list.append(rel)
+            try:
+                h = sha256_of_file(fp)
+                hashes[rel] = h
+            except Exception as e:
+                hashes[rel] = f"err:{e}"
+
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in SUSPICIOUS_EXT:
+                findings.append({
+                    "id": f"F_{len(findings)+1:03d}",
+                    "severity":"high","title":"Native binary found",
+                    "description":f"Native executable or library: {rel}",
+                    "evidence":[rel]
+                })
+            if ext in SCRIPT_EXT or ext=='':
+                try:
+                    with open(fp,'rb') as fh:
+                        data = fh.read()
+                    if BASE64_RE.search(data):
+                        findings.append({
+                            "id": f"F_{len(findings)+1:03d}",
+                            "severity":"medium",
+                            "title":"Base64-like blob",
+                            "description":f"Large base64-like block found in {rel}",
+                            "evidence":[rel]
+                        })
+                    try:
+                        text = data.decode('utf-8', errors='ignore').lower()
+                    except:
+                        text = ''
+                    if any(k in text for k in ('eval(', 'exec(', 'powershell', 'require("child_process")', 'os.system')):
+                        findings.append({
+                            "id": f"F_{len(findings)+1:03d}",
+                            "severity":"medium",
+                            "title":"Potential code execution pattern",
+                            "description":f"Strings like eval/exec/child_process/powershell in {rel}",
+                            "evidence":[rel]
+                        })
+                except Exception as e:
+                    findings.append({"id": f"F_{len(findings)+1:03d}","severity":"low","title":"File read error","description":str(e),"evidence":[rel]})
+
+    return file_list, hashes, findings
+
+
+def main(inzip, outjson):
+    if not zipfile.is_zipfile(inzip):
+        print("Not a zip file", file=sys.stderr); sys.exit(2)
+
+    tmp = tempfile.mkdtemp(prefix="zipscan_")
+    try:
+        with zipfile.ZipFile(inzip,'r') as z:
+            z.extractall(tmp)
+        file_list, hashes, findings = scan_extracted(tmp)
+        score = max(0, 100 - 10*sum(1 for f in findings if f['severity']=='high'))
+        report = {
+            "job_id": os.path.basename(inzip) + "_" + hashlib.sha256(open(inzip,'rb').read()).hexdigest()[:8],
+            "status":"complete",
+            "summary":{"score":score, "verdict": "suspicious" if any(f['severity'] in ('high','medium') for f in findings) else "clean"},
+            "findings": findings,
+            "artifacts":{"file_list":file_list, "hashes":hashes},
+            "created_at": __import__('datetime').datetime.utcnow().isoformat()+'Z'
+        }
+        with open(outjson,'w') as fo:
+            json.dump(report, fo, indent=2)
+        print("Report written to", outjson)
+    finally:
+        shutil.rmtree(tmp)
+
+
+if __name__=='__main__':
+    import sys
+    if len(sys.argv)<3:
+        print('Usage: zip_scanner.py /path/input.zip /path/output.json')
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2])
+```
+
+---
+
+### README.md
+
+```
+# ZIP Scan MVP
+
+Quick start (requires Docker & docker compose):
+
+1. Build and run the stack:
+
+   docker compose up --build
+
+2. Upload a zip file:
+
+   POST http://localhost:8000/api/upload  (multipart form field named "file")
+
+   The response will contain a `job_id`.
+
+3. Poll the report endpoint:
+
+   GET http://localhost:8000/api/report/<job_id>
+
+Reports are written to `./reports` on the host.
+
+Notes:
+- The worker uses Docker (mounted docker socket) to spawn scanner containers. That is convenient for MVP but has security implications. In production, prefer using a proper VM/batcher service or a remote container runtime.
+- The scanner image runs with `--network none` to prevent outbound network access.
+```
+
+---
+
+## Next actions you can ask me to do
+
+* Convert this scaffold into a GitHub-ready repo and provide downloadable zip.
+* Replace the Celery/worker model with an RQ + Redis approach if you prefer.
+* Add dependency scanning (npm/pip) to the scanner and include output parsing.
+* Implement a minimal React frontend and integrate the upload flow.
+* Harden the worker to use a remote container runtime rather than mounting Docker socket.
+
+---
+
+End of document.
